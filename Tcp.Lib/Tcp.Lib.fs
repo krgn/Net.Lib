@@ -5,6 +5,7 @@ open System.Text
 open System.Net
 open System.Net.Sockets
 open System.Threading
+open System.Threading.Tasks
 open System.Collections.Concurrent
 
 [<AutoOpen>]
@@ -69,9 +70,7 @@ module Lib =
 
       let subscriptions = Subscriptions()
 
-      let state =
-        { Socket = socket
-          Subscriptions = subsriptions }
+      let state = Unchecked.defaultof<SharedState>
 
       let receiver: Thread = Thread(ThreadStart(receiver state))
 
@@ -225,3 +224,172 @@ module Lib =
 
             acceptor.Abort()
             listener.Stop() }
+
+  //     _                         ____
+  //    / \   ___ _   _ _ __   ___/ ___|  ___ _ ____   _____ _ __
+  //   / _ \ / __| | | | '_ \ / __\___ \ / _ \ '__\ \ / / _ \ '__|
+  //  / ___ \\__ \ |_| | | | | (__ ___) |  __/ |   \ V /  __/ |
+  // /_/   \_\___/\__, |_| |_|\___|____/ \___|_|    \_/ \___|_|
+  //              |___/
+
+  module AsyncServer =
+
+    type private Subscriptions = ConcurrentDictionary<Guid,IObserver<Guid * byte array>>
+
+    type Connections = ConcurrentDictionary<Guid,IConnection>
+
+    type private SharedState =
+      { Connections: Connections
+        Subscriptions: Subscriptions
+        Socket: TcpListener }
+
+    type private SocketState() as state =
+      let bufSize = 1024
+      let buf: byte[] = Array.zeroCreate bufSize
+      let builder = StringBuilder()
+
+      let rec loop () =  async {
+          do! Async.Sleep(1000)
+          try
+            if not (state.Socket.Poll(1, SelectMode.SelectRead) && state.Socket.Available = 0) then
+              printfn "still connected"
+              return! loop()
+          with
+            | exn ->
+              printfn "disconnected"
+              try
+                state.Socket.Shutdown(SocketShutdown.Both)
+                state.Socket.Close()
+              with
+                | _ -> ()
+              state.Socket.Dispose()
+        }
+
+      do Async.Start(loop())
+
+      // Client  socket.
+      [<DefaultValue>] val mutable Socket:Socket
+
+      member state.BufferSize with get () = bufSize
+
+      // Receive buffer.
+      member state.Buffer
+        with get () = buf
+
+      member state.Builder
+        with get () = builder
+
+    let sendCallback (result: IAsyncResult) =
+      try
+        // Retrieve the socket from the state object.
+        let handler = result.AsyncState :?> Socket
+
+        // Complete sending the data to the remote device.
+        let bytesSent = handler.EndSend(result)
+
+        printfn "Sent %d bytes to client." bytesSent
+
+        handler.Shutdown(SocketShutdown.Both)
+        handler.Close()
+
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
+
+    let send (socket: Socket) (data: string) =
+      // Convert the string data to byte data using ASCII encoding.
+      let byteData = Encoding.UTF8.GetBytes(data)
+
+      // Begin sending the data to the remote device.
+      socket.BeginSend(
+        byteData,
+        0,
+        byteData.Length,
+        SocketFlags.None,
+        AsyncCallback(sendCallback),
+        socket)
+      |> ignore
+
+    let rec receiveCallback (result: IAsyncResult) =
+      let mutable content = String.Empty
+
+      // Retrieve the state object and the handler socket
+      // from the asynchronous state object.
+      let state = result.AsyncState :?> SocketState
+      let handler = state.Socket
+
+      // Read data from the client socket.
+      let bytesRead = handler.EndReceive(result)
+
+      if bytesRead > 0 then
+        // There  might be more data, so store the data received so far.
+        state.Builder.Append(Encoding.UTF8.GetString(state.Buffer,0,bytesRead)) |> ignore
+
+        // Check for end-of-file tag. If it is not there, read
+        // more data.
+        content <- state.Builder.ToString()
+        if (content.IndexOf("<EOF>") > -1) then
+          // All the data has been read from the
+          // client. Display it on the console.
+          printfn "Read %d bytes from socket. \n Data : %s" content.Length content
+          // Echo the data back to the client.
+          send handler content
+        else
+          // Not all data received. Get more.
+          handler.BeginReceive(
+            state.Buffer,
+            0,
+            state.BufferSize,
+            SocketFlags.None,
+            AsyncCallback(receiveCallback),
+            state)
+          |> ignore
+
+
+    let start (addr: IPAddress) (port: int) =
+      let subscriptions = Subscriptions()
+      let connections = ConcurrentDictionary<Guid,IConnection>()
+      let allDone = new ManualResetEvent(false)
+      let listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+      let endpoint = IPEndPoint(addr, port)
+
+      listener.Bind(endpoint)
+      listener.Listen(100)
+
+      let acceptCallback (result: IAsyncResult) =
+        allDone.Set() |> ignore
+
+        let listener = result.AsyncState :?> Socket
+        let handler = listener.EndAccept(result)
+        let state = SocketState()
+        state.Socket <- handler
+
+        handler.BeginReceive(
+          state.Buffer,
+          0,
+          state.BufferSize,
+          SocketFlags.None,
+          AsyncCallback(receiveCallback),
+          state)
+        |> ignore
+
+      let acceptor () =
+        while true do
+          allDone.Reset() |> ignore
+          printfn "Waiting for new connections"
+          listener.BeginAccept(AsyncCallback(acceptCallback), listener) |> ignore
+          allDone.WaitOne() |> ignore
+
+      let thread = Thread(ThreadStart(acceptor))
+      thread.Start()
+
+      { new IDisposable with
+          member self.Dispose() =
+            thread.Abort()
+            try
+              listener.Shutdown(SocketShutdown.Both)
+              listener.Close()
+            with
+              | _ -> ()
+            listener.Dispose() }
