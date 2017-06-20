@@ -1,5 +1,6 @@
 namespace Tcp
 open System
+open System.Text
 open System.Net
 open System.Net.Sockets
 open System.Threading
@@ -29,7 +30,6 @@ module Lib =
     abstract Send: byte array -> unit
     abstract Id: Guid
     abstract IPAddress: IPAddress
-    abstract Subscribe: (byte array -> unit) -> IDisposable
 
   type IServer =
     inherit IDisposable
@@ -71,11 +71,26 @@ module Lib =
 
   module private Connection =
 
-    let create (client: TcpClient) =
-      let id = Guid.NewGuid()
+    type Event =
+      | Disconnect of Guid
+      | Request    of Guid * byte array
 
+    let private receiver (id: Guid) (client: TcpClient) (cb: Event -> unit) () =
+      let stream = client.GetStream()
+      while not (client.Client.Poll(1, SelectMode.SelectRead) && client.Client.Available = 0) do
+        let buffer = Array.zeroCreate 512
+        stream.Read(buffer,0,buffer.Length) |> ignore
+        Event.Request(id, buffer) |> cb
+        Thread.Sleep(1)
+      id |> Event.Disconnect |> cb
+
+    let create (client: TcpClient) (cb: Event -> unit) =
+      let id = Guid.NewGuid()
+      let cts = new CancellationTokenSource()
       let stream  = client.GetStream()
-      let receiver: Thread = Unchecked.defaultof<Thread>
+
+      let receiver: Thread = Thread(ThreadStart(receiver id client cb))
+      receiver.Start()
 
       { new IConnection with
           member connection.Send (bytes: byte array) =
@@ -85,15 +100,18 @@ module Lib =
           member connection.Id
             with get () = id
 
-          member connection.Subscribe callback =
-            failwith "Subscribe"
-
           member connection.IPAddress
             with get () =
               let endpoint = client.Client.RemoteEndPoint :?> IPEndPoint
               endpoint.Address
 
           member connection.Dispose() =
+            printfn "disposing %O" id
+            cts.Cancel()
+            cts.Dispose()
+            receiver.Abort()
+            stream.Close()
+            stream.Dispose()
             client.Dispose() }
 
   //  ____
@@ -113,12 +131,35 @@ module Lib =
         Socket: TcpListener }
 
     let private acceptor (state: SharedState) () =
+      state.Socket.LocalEndpoint :?> IPEndPoint
+      |> printfn "server now accepting connectsion on %O"
+
+      let pending = ConcurrentQueue<Guid>()
+
       while true do
+        while pending.Count > 0 do
+          match pending.TryDequeue() with
+          | true, id ->
+            match state.Connections.TryRemove(id) with
+            | true, connection ->
+              connection.Dispose()
+              printfn "removed: %O" id
+            | false, _ -> ()
+            printfn "open connections: %d" state.Connections.Count
+          | false, _-> ()
+
         let client = state.Socket.AcceptTcpClient()
-        let connection = Connection.create client
+
+        let rec connection = Connection.create client <| function
+          | Connection.Event.Disconnect id -> pending.Enqueue id
+          | Connection.Event.Request (id,body) ->
+            Encoding.UTF8.GetString(body)
+            |> printfn "id: %O sent: %s" id
 
         while not (state.Connections.TryAdd(connection.Id, connection)) do
           ignore ()
+
+        printfn "open connections: %d" state.Connections.Count
 
         printfn "added new connection from %O" connection.IPAddress
 
@@ -149,5 +190,8 @@ module Lib =
             failwith "Subscribe"
 
           member server.Dispose() =
+            for KeyValue(_,connection) in connections.ToArray() do
+              connection.Dispose()
+
             acceptor.Abort()
             listener.Stop() }
