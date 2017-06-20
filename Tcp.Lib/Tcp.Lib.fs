@@ -154,7 +154,9 @@ module Lib =
           | Connection.Event.Disconnect id -> pending.Enqueue id
           | Connection.Event.Request (id,body) ->
             Encoding.UTF8.GetString(body)
-            |> printfn "id: %O sent: %s" id
+            |> sprintf "id: %O sent: %s" id
+            |> Encoding.UTF8.GetBytes
+            |> connection.Send
 
         while not (state.Connections.TryAdd(connection.Id, connection)) do
           ignore ()
