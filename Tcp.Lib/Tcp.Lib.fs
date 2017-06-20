@@ -46,10 +46,34 @@ module Lib =
 
   module Client =
 
-    let create (addr: string) (port: int) =
+    type Event =
+      | Disconnected
+      | Response of byte array
+
+    type private Subscriptions = ConcurrentDictionary<Guid,IObserver<Event>>
+
+    type private SharedState =
+      { Socket: TcpClient
+        Subscriptions: Subscriptions }
+
+    let private receiver (state: SharedState) () =
+      let stream = state.Socket.GetStream()
+
+      while not (state.Socket.Client.Poll(1, SelectMode.SelectRead) && state.Socket.Client.Available = 0) do
+        printfn "yeeeeeah"
+
+      Observable.onNext state.Subscriptions Disconnected
+
+    let create (addr: IPAddress) (port: int) =
       let id = Guid.NewGuid()
 
-      let receiver: Thread = Unchecked.defaultof<Thread>
+      let subscriptions = Subscriptions()
+
+      let state =
+        { Socket = socket
+          Subscriptions = subsriptions }
+
+      let receiver: Thread = Thread(ThreadStart(receiver state))
 
       { new IClientSocket with
           member socket.Send(bytes) =
