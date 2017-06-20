@@ -1,4 +1,4 @@
-namespace Iris.Core
+namespace Tcp
 
 // * Imports
 

@@ -1,4 +1,5 @@
 namespace Tcp
+
 open System
 open System.Text
 open System.Net
@@ -35,7 +36,7 @@ module Lib =
     inherit IDisposable
     abstract Connections: ConcurrentDictionary<Guid,IConnection>
     abstract Send: Guid -> byte array -> unit
-    abstract Subscribe: (byte array -> unit) ->  IDisposable
+    abstract Subscribe: (Guid * byte array -> unit) ->  IDisposable
 
   //   ____ _ _            _
   //  / ___| (_) ___ _ __ | |_
@@ -122,7 +123,7 @@ module Lib =
 
   module Server =
 
-    type Subscriptions = ConcurrentDictionary<Guid,IObservable<byte array>>
+    type Subscriptions = ConcurrentDictionary<Guid,IObserver<Guid * byte array>>
     type Connections = ConcurrentDictionary<Guid,IConnection>
 
     type private SharedState =
@@ -132,7 +133,7 @@ module Lib =
 
     let private acceptor (state: SharedState) () =
       state.Socket.LocalEndpoint :?> IPEndPoint
-      |> printfn "server now accepting connectsion on %O"
+      |> printfn "server now accepting connections on %O"
 
       let pending = ConcurrentQueue<Guid>()
 
@@ -156,17 +157,15 @@ module Lib =
             Encoding.UTF8.GetString(body)
             |> sprintf "id: %O sent: %s" id
             |> Encoding.UTF8.GetBytes
-            |> connection.Send
+            |> fun body -> Observable.onNext state.Subscriptions (id, body)
 
         while not (state.Connections.TryAdd(connection.Id, connection)) do
           ignore ()
 
-        printfn "open connections: %d" state.Connections.Count
-
         printfn "added new connection from %O" connection.IPAddress
 
     let create (addr: IPAddress) (port: int) =
-      let subscriptions = ConcurrentDictionary<Guid,IObservable<byte array>>()
+      let subscriptions = Subscriptions()
       let connections = ConcurrentDictionary<Guid,IConnection>()
 
       let listener = TcpListener(addr, port)
@@ -186,10 +185,15 @@ module Lib =
             with get () = connections
 
           member server.Send (id: Guid) (bytes: byte array) =
-            failwith "Send"
+            try
+              connections.[id].Send bytes
+            with
+              | exn ->
+                exn.Message
+                |> printfn "Error in Send: %s"
 
-          member server.Subscribe (callback: byte array -> unit) =
-            failwith "Subscribe"
+          member server.Subscribe (callback: Guid * byte array -> unit) =
+            Observable.subscribe callback subscriptions
 
           member server.Dispose() =
             for KeyValue(_,connection) in connections.ToArray() do
