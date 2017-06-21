@@ -27,17 +27,31 @@ module Lib =
     abstract Send: byte array -> unit
     abstract Subscribe: (byte array -> unit) ->  IDisposable
 
+  type ServerEvent =
+    | Connect    of id:Guid * ip:IPAddress * Port:int
+    | Disconnect of id:Guid
+    | Request    of id:Guid * request:byte array
+
+  type Subscriptions = ConcurrentDictionary<Guid,IObserver<ServerEvent>>
+
   type IConnection =
     inherit IDisposable
+    abstract Socket: Socket
     abstract Send: byte array -> unit
     abstract Id: Guid
     abstract IPAddress: IPAddress
+    abstract Port: int
+    abstract Buffer: byte array
+    abstract BufferSize: int
+    abstract Subscriptions: Subscriptions
+
+  type Connections = ConcurrentDictionary<Guid,IConnection>
 
   type IServer =
     inherit IDisposable
-    abstract Connections: ConcurrentDictionary<Guid,IConnection>
+    abstract Connections: Connections
     abstract Send: Guid -> byte array -> unit
-    abstract Subscribe: (Guid * byte array -> unit) ->  IDisposable
+    abstract Subscribe: (ServerEvent -> unit) ->  IDisposable
 
   //   ____ _ _            _
   //  / ___| (_) ___ _ __ | |_
@@ -87,6 +101,49 @@ module Lib =
           member socket.Dispose () =
             failwith "Dispose" }
 
+
+  //  ____  _                        _
+  // / ___|| |__   __ _ _ __ ___  __| |
+  // \___ \| '_ \ / _` | '__/ _ \/ _` |
+  //  ___) | | | | (_| | | |  __/ (_| |
+  // |____/|_| |_|\__,_|_|  \___|\__,_|
+
+  module private Shared =
+
+    type IState =
+      inherit IDisposable
+      abstract DoneSignal: ManualResetEvent
+      abstract Connections: Connections
+      abstract Subscriptions: Subscriptions
+      abstract Listener: Socket
+
+    let create (socket: Socket) =
+      let signal = new ManualResetEvent(false)
+      let connections = Connections()
+      let subscriptions = Subscriptions()
+
+      { new IState with
+          member state.DoneSignal
+            with get () = signal
+
+          member state.Connections
+            with get () = connections
+
+          member state.Subscriptions
+            with get () = subscriptions
+
+          member state.Listener
+            with get () = socket
+
+          member state.Dispose() =
+            try
+              socket.Shutdown(SocketShutdown.Both)
+              socket.Close()
+            with
+              | _ ->
+                socket.Dispose()
+            signal.Dispose() }
+
   //   ____                            _   _
   //  / ___|___  _ __  _ __   ___  ___| |_(_) ___  _ __
   // | |   / _ \| '_ \| '_ \ / _ \/ __| __| |/ _ \| '_ \
@@ -94,190 +151,6 @@ module Lib =
   //  \____\___/|_| |_|_| |_|\___|\___|\__|_|\___/|_| |_|
 
   module private Connection =
-
-    type Event =
-      | Disconnect of Guid
-      | Request    of Guid * byte array
-
-    let private receiver (id: Guid) (client: TcpClient) (cb: Event -> unit) () =
-      let stream = client.GetStream()
-      while not (client.Client.Poll(1, SelectMode.SelectRead) && client.Client.Available = 0) do
-        let buffer = Array.zeroCreate 512
-        stream.Read(buffer,0,buffer.Length) |> ignore
-        Event.Request(id, buffer) |> cb
-        Thread.Sleep(1)
-      id |> Event.Disconnect |> cb
-
-    let create (client: TcpClient) (cb: Event -> unit) =
-      let id = Guid.NewGuid()
-      let cts = new CancellationTokenSource()
-      let stream  = client.GetStream()
-
-      let receiver: Thread = Thread(ThreadStart(receiver id client cb))
-      receiver.Start()
-
-      { new IConnection with
-          member connection.Send (bytes: byte array) =
-            stream.Write(bytes, 0, Array.length bytes)
-            stream.Flush()
-
-          member connection.Id
-            with get () = id
-
-          member connection.IPAddress
-            with get () =
-              let endpoint = client.Client.RemoteEndPoint :?> IPEndPoint
-              endpoint.Address
-
-          member connection.Dispose() =
-            printfn "disposing %O" id
-            cts.Cancel()
-            cts.Dispose()
-            receiver.Abort()
-            stream.Close()
-            stream.Dispose()
-            client.Dispose() }
-
-  //  ____
-  // / ___|  ___ _ ____   _____ _ __
-  // \___ \ / _ \ '__\ \ / / _ \ '__|
-  //  ___) |  __/ |   \ V /  __/ |
-  // |____/ \___|_|    \_/ \___|_|
-
-  module Server =
-
-    type Subscriptions = ConcurrentDictionary<Guid,IObserver<Guid * byte array>>
-    type Connections = ConcurrentDictionary<Guid,IConnection>
-
-    type private SharedState =
-      { Connections: Connections
-        Subscriptions: Subscriptions
-        Socket: TcpListener }
-
-    let private acceptor (state: SharedState) () =
-      state.Socket.LocalEndpoint :?> IPEndPoint
-      |> printfn "server now accepting connections on %O"
-
-      let pending = ConcurrentQueue<Guid>()
-
-      while true do
-        while pending.Count > 0 do
-          match pending.TryDequeue() with
-          | true, id ->
-            match state.Connections.TryRemove(id) with
-            | true, connection ->
-              connection.Dispose()
-              printfn "removed: %O" id
-            | false, _ -> ()
-            printfn "open connections: %d" state.Connections.Count
-          | false, _-> ()
-
-        let client = state.Socket.AcceptTcpClient()
-
-        let rec connection = Connection.create client <| function
-          | Connection.Event.Disconnect id -> pending.Enqueue id
-          | Connection.Event.Request (id,body) ->
-            Encoding.UTF8.GetString(body)
-            |> sprintf "id: %O sent: %s" id
-            |> Encoding.UTF8.GetBytes
-            |> fun body -> Observable.onNext state.Subscriptions (id, body)
-
-        while not (state.Connections.TryAdd(connection.Id, connection)) do
-          ignore ()
-
-        printfn "added new connection from %O" connection.IPAddress
-
-    let create (addr: IPAddress) (port: int) =
-      let subscriptions = Subscriptions()
-      let connections = ConcurrentDictionary<Guid,IConnection>()
-
-      let listener = TcpListener(addr, port)
-      listener.Start()
-
-      let state =
-        { Socket = listener
-          Connections = connections
-          Subscriptions = subscriptions }
-
-      let acceptor: Thread = Thread(ThreadStart(acceptor state))
-
-      acceptor.Start()
-
-      { new IServer with
-          member server.Connections
-            with get () = connections
-
-          member server.Send (id: Guid) (bytes: byte array) =
-            try
-              connections.[id].Send bytes
-            with
-              | exn ->
-                exn.Message
-                |> printfn "Error in Send: %s"
-
-          member server.Subscribe (callback: Guid * byte array -> unit) =
-            Observable.subscribe callback subscriptions
-
-          member server.Dispose() =
-            for KeyValue(_,connection) in connections.ToArray() do
-              connection.Dispose()
-
-            acceptor.Abort()
-            listener.Stop() }
-
-  //     _                         ____
-  //    / \   ___ _   _ _ __   ___/ ___|  ___ _ ____   _____ _ __
-  //   / _ \ / __| | | | '_ \ / __\___ \ / _ \ '__\ \ / / _ \ '__|
-  //  / ___ \\__ \ |_| | | | | (__ ___) |  __/ |   \ V /  __/ |
-  // /_/   \_\___/\__, |_| |_|\___|____/ \___|_|    \_/ \___|_|
-  //              |___/
-
-  module AsyncServer =
-
-    type private Subscriptions = ConcurrentDictionary<Guid,IObserver<Guid * byte array>>
-
-    type Connections = ConcurrentDictionary<Guid,IConnection>
-
-    type private SharedState =
-      { Connections: Connections
-        Subscriptions: Subscriptions
-        Socket: TcpListener }
-
-    type private SocketState() as state =
-      let bufSize = 1024
-      let buf: byte[] = Array.zeroCreate bufSize
-      let builder = StringBuilder()
-
-      let rec loop () =  async {
-          do! Async.Sleep(1000)
-          try
-            if not (state.Socket.Poll(1, SelectMode.SelectRead) && state.Socket.Available = 0) then
-              printfn "still connected"
-              return! loop()
-          with
-            | exn ->
-              printfn "disconnected"
-              try
-                state.Socket.Shutdown(SocketShutdown.Both)
-                state.Socket.Close()
-              with
-                | _ -> ()
-              state.Socket.Dispose()
-        }
-
-      do Async.Start(loop())
-
-      // Client  socket.
-      [<DefaultValue>] val mutable Socket:Socket
-
-      member state.BufferSize with get () = bufSize
-
-      // Receive buffer.
-      member state.Buffer
-        with get () = buf
-
-      member state.Builder
-        with get () = builder
 
     let sendCallback (result: IAsyncResult) =
       try
@@ -288,27 +161,29 @@ module Lib =
         let bytesSent = handler.EndSend(result)
 
         printfn "Sent %d bytes to client." bytesSent
-
-        handler.Shutdown(SocketShutdown.Both)
-        handler.Close()
-
       with
         | exn ->
           exn.Message
           |> printfn "exn: %s"
 
-    let send (socket: Socket) (data: string) =
-      // Convert the string data to byte data using ASCII encoding.
-      let byteData = Encoding.UTF8.GetBytes(data)
-
-      // Begin sending the data to the remote device.
+    let send (socket: Socket) (data: byte array) =
       socket.BeginSend(
-        byteData,
+        data,
         0,
-        byteData.Length,
+        data.Length,
         SocketFlags.None,
         AsyncCallback(sendCallback),
         socket)
+      |> ignore
+
+    let private beginReceive (connection: IConnection) callback =
+      connection.Socket.BeginReceive(
+        connection.Buffer,              // buffer to write to
+        0,                              // offset in buffer
+        connection.BufferSize,          // size of internal buffer
+        SocketFlags.None,               // no flags
+        AsyncCallback(callback),        // when done, invoke this callback
+        connection)                     // pass-on connection into callback
       |> ignore
 
     let rec receiveCallback (result: IAsyncResult) =
@@ -316,80 +191,196 @@ module Lib =
 
       // Retrieve the state object and the handler socket
       // from the asynchronous state object.
-      let state = result.AsyncState :?> SocketState
-      let handler = state.Socket
+      let connection = result.AsyncState :?> IConnection
 
-      // Read data from the client socket.
-      let bytesRead = handler.EndReceive(result)
+      try
+        // Read data from the client socket.
+        let bytesRead = connection.Socket.EndReceive(result)
 
-      if bytesRead > 0 then
-        // There  might be more data, so store the data received so far.
-        state.Builder.Append(Encoding.UTF8.GetString(state.Buffer,0,bytesRead)) |> ignore
+        if bytesRead > 0 then
 
-        // Check for end-of-file tag. If it is not there, read
-        // more data.
-        content <- state.Builder.ToString()
-        if (content.IndexOf("<EOF>") > -1) then
-          // All the data has been read from the
-          // client. Display it on the console.
-          printfn "Read %d bytes from socket. \n Data : %s" content.Length content
-          // Echo the data back to the client.
-          send handler content
-        else
-          // Not all data received. Get more.
-          handler.BeginReceive(
-            state.Buffer,
-            0,
-            state.BufferSize,
-            SocketFlags.None,
-            AsyncCallback(receiveCallback),
-            state)
-          |> ignore
+          let payload =
+            if bytesRead = connection.BufferSize then
+              connection.Buffer
+            else
+              let intermediary = Array.zeroCreate bytesRead
+              Array.blit connection.Buffer 0 intermediary 0 bytesRead
+              intermediary
+
+          (connection.Id, payload)
+          |> ServerEvent.Request
+          |> Observable.onNext connection.Subscriptions
+
+          // // Check for end-of-file tag. If it is not there, read
+          // // more data.
+          // content <- state.Builder.ToString()
+          // if (content.IndexOf("<EOF>") > -1) then
+          //   // All the data has been read from the
+          //   // client. Display it on the console.
+          //   printfn "Read %d bytes from socket. \n Data : %s" content.Length content
+          //   // Echo the data back to the client.
+          // else
+
+        // keep trying to get more
+        beginReceive connection receiveCallback
+      with
+        | :? ObjectDisposedException ->
+          connection.Id
+          |> ServerEvent.Disconnect
+          |> Observable.onNext connection.Subscriptions
+        | exn ->
+          exn.Message
+          |> printfn "EXN: receiveCallback: %s"
+
+    let private isAlive (socket:Socket) =
+      not (socket.Poll(1, SelectMode.SelectRead) && socket.Available = 0)
+
+    let rec private checkState (connection: IConnection) =
+      async {
+        do! Async.Sleep(1000)
+        try
+          if isAlive connection.Socket then
+            return! checkState connection
+          else
+            connection.Id
+            |> ServerEvent.Disconnect
+            |> Observable.onNext connection.Subscriptions
+        with
+          | _ ->
+            connection.Id
+            |> ServerEvent.Disconnect
+            |> Observable.onNext connection.Subscriptions
+      }
+
+    let create (state: Shared.IState) (socket: Socket)  =
+      let id = Guid.NewGuid()
+      let cts = new CancellationTokenSource()
+      let endpoint = socket.RemoteEndPoint :?> IPEndPoint
+
+      let bufSize = 1024
+      let buffer = Array.zeroCreate bufSize
+
+      let connection =
+        { new IConnection with
+            member connection.Socket
+              with get () = socket
+
+            member connection.Send (bytes: byte array) =
+              send socket bytes
+
+            member connection.Id
+              with get () = id
+
+            member connection.IPAddress
+              with get () = endpoint.Address
+
+            member connection.Port
+              with get () = endpoint.Port
+
+            member connection.Buffer
+              with get () = buffer
+
+            member connection.BufferSize
+              with get () = bufSize
+
+            member connection.Subscriptions
+              with get () = state.Subscriptions
+
+            member connection.Dispose() =
+              printfn "disposing %O" id
+              try
+                cts.Cancel()
+                cts.Dispose()
+              with
+                | _ -> ()
+              try
+                socket.Shutdown(SocketShutdown.Both)
+                socket.Close()
+              with
+                | _ -> ()
+              socket.Dispose() }
+
+      Async.Start(checkState connection, cts.Token)
+      beginReceive connection receiveCallback
+      connection
 
 
-    let start (addr: IPAddress) (port: int) =
-      let subscriptions = Subscriptions()
-      let connections = ConcurrentDictionary<Guid,IConnection>()
-      let allDone = new ManualResetEvent(false)
+  //  ____
+  // / ___|  ___ _ ____   _____ _ __
+  // \___ \ / _ \ '__\ \ / / _ \ '__|
+  //  ___) |  __/ |   \ V /  __/ |
+  // |____/ \___|_|    \_/ \___|_|
+
+  module Server =
+
+    let private acceptCallback (state: Shared.IState) (result: IAsyncResult) =
+      state.DoneSignal.Set() |> ignore
+
+      let state = result.AsyncState :?> Shared.IState
+
+      try
+        let connection =
+          result
+          |> state.Listener.EndAccept
+          |> Connection.create state
+
+        while not (state.Connections.TryAdd(connection.Id, connection)) do
+          ignore ()
+
+      with
+        | exn ->
+          exn.Message
+          |> printfn "acceptCallback: %s"
+
+    let private acceptor (state: Shared.IState) () =
+      while true do
+        state.DoneSignal.Reset() |> ignore
+        printfn "Waiting for new connections"
+        state.Listener.BeginAccept(AsyncCallback(acceptCallback state), state) |> ignore
+        state.DoneSignal.WaitOne() |> ignore
+
+    let private cleanUp (connections: Connections) = function
+      | ServerEvent.Disconnect id ->
+        match connections.TryRemove id with
+        | true, connection -> connection.Dispose()
+        | false, _ -> ()
+        printfn "current number of connections: %d" connections.Count
+      | _ -> ()
+
+    let create (addr: IPAddress) (port: int) =
       let listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
       let endpoint = IPEndPoint(addr, port)
 
       listener.Bind(endpoint)
       listener.Listen(100)
 
-      let acceptCallback (result: IAsyncResult) =
-        allDone.Set() |> ignore
+      let state = Shared.create listener
 
-        let listener = result.AsyncState :?> Socket
-        let handler = listener.EndAccept(result)
-        let state = SocketState()
-        state.Socket <- handler
+      let cleaner = Observable.subscribe (cleanUp state.Connections) state.Subscriptions
 
-        handler.BeginReceive(
-          state.Buffer,
-          0,
-          state.BufferSize,
-          SocketFlags.None,
-          AsyncCallback(receiveCallback),
-          state)
-        |> ignore
-
-      let acceptor () =
-        while true do
-          allDone.Reset() |> ignore
-          printfn "Waiting for new connections"
-          listener.BeginAccept(AsyncCallback(acceptCallback), listener) |> ignore
-          allDone.WaitOne() |> ignore
-
-      let thread = Thread(ThreadStart(acceptor))
+      let thread = Thread(ThreadStart(acceptor state))
       thread.Start()
 
-      { new IDisposable with
-          member self.Dispose() =
-            thread.Abort()
+      { new IServer with
+          member server.Connections
+            with get () = state.Connections
+
+          member server.Send (id: Guid) (bytes: byte array) =
             try
-              listener.Shutdown(SocketShutdown.Both)
-              listener.Close()
+              state.Connections.[id].Send bytes
             with
-              | _ -> ()
-            listener.Dispose() }
+              | exn ->
+                exn.Message
+                |> printfn "Error in Send: %s"
+
+          member server.Subscribe (callback: ServerEvent -> unit) =
+            Observable.subscribe callback state.Subscriptions
+
+          member server.Dispose() =
+            cleaner.Dispose()
+
+            for KeyValue(_,connection) in state.Connections.ToArray() do
+              connection.Dispose()
+
+            thread.Abort()
+            state.Dispose() }

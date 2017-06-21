@@ -12,50 +12,38 @@ let main argv =
     let addr = IPAddress.Parse argv.[0]
     let port = int argv.[1]
 
-    let server = AsyncServer.start addr port
+    let server = Server.create addr port
+
+    let loop (server: IServer) (inbox: MailboxProcessor<ServerEvent>) =
+      let rec impl () =
+        async {
+          let! msg = inbox.Receive()
+          match msg with
+          | ServerEvent.Connect(id, ip, port) ->
+            printfn "new connection %O from %O:%d" id ip port
+          | ServerEvent.Disconnect id ->
+            printfn "connection %O closed" id
+          | ServerEvent.Request(id, body) ->
+            body
+            |> Encoding.UTF8.GetString
+            |> printfn "got: %s"
+            server.Send id (Encoding.UTF8.GetBytes "Thanks!")
+          return! impl()
+        }
+      impl()
+
+    let cts = new CancellationTokenSource()
+    let actor = MailboxProcessor.Start(loop server, cts.Token)
+
+    server.Subscribe actor.Post |> ignore
 
     Console.ReadLine() |> ignore
 
+    cts.Cancel()
     server.Dispose()
 
-    0
+    0 // return an integer exit code
   with
     | exn ->
-      printfn "ex: %s" exn.Message
+      printfn "%s" exn.Message
       1
-
-// [<EntryPoint>]
-// let main argv =
-//   try
-//     let addr = IPAddress.Parse argv.[0]
-//     let port = int argv.[1]
-
-//     let server = Server.create addr port
-
-//     let loop (server: IServer) (inbox: MailboxProcessor<Guid * byte[]>) =
-//       let rec impl () =
-//         async {
-//           let! (id, body) = inbox.Receive()
-//           body
-//           |> Encoding.UTF8.GetString
-//           |> printfn "got: %s"
-//           server.Send id (Encoding.UTF8.GetBytes "Thanks!")
-//           return! impl()
-//         }
-//       impl()
-
-//     let cts = new CancellationTokenSource()
-//     let actor = MailboxProcessor.Start(loop server, cts.Token)
-
-//     server.Subscribe actor.Post |> ignore
-
-//     Console.ReadLine() |> ignore
-
-//     cts.Cancel()
-//     server.Dispose()
-
-//     0 // return an integer exit code
-//   with
-//     | exn ->
-//       printfn "%s" exn.Message
-//       1
