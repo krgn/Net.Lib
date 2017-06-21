@@ -572,13 +572,14 @@ module Lib =
 
     type private IState =
       abstract Id: Guid
-      abstract EndPoint: IPEndPoint
+      abstract LocalEndPoint: IPEndPoint
+      abstract RemoteEndPoint: IPEndPoint
       abstract Client: UdpClient
       abstract Subscriptions: ConcurrentDictionary<Guid,IObserver<PubSubEvent>>
 
     let private receiveCallback (ar: IAsyncResult) =
       let state = ar.AsyncState :?> IState
-      let raw = state.Client.EndReceive(ar, &state.EndPoint)
+      let raw = state.Client.EndReceive(ar, &state.LocalEndPoint)
 
       let guid =
         let intermediate = Array.zeroCreate 16
@@ -601,6 +602,26 @@ module Lib =
       state.Client.BeginReceive(AsyncCallback(receiveCallback), state)
       |> ignore
 
+    let private sendCallback (ar: IAsyncResult) =
+      try
+        let state = ar.AsyncState :?> IState
+        state.Client.EndSend(ar)
+        |> printfn "Bytes sent: %d"
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
+
+    let private beginSend (state: IState) (data: byte array) =
+      let payload = Array.append (state.Id.ToByteArray()) data
+      state.Client.BeginSend(
+        payload,
+        payload.Length,
+        state.RemoteEndPoint,
+        AsyncCallback(sendCallback),
+        state)
+      |> ignore
+
     let create (multicastAddress: IPAddress) (port: int) =
       let id = Guid.NewGuid()
 
@@ -616,21 +637,24 @@ module Lib =
       client.Client.Bind(localEp)
       client.JoinMulticastGroup(multicastAddress)
 
-      { new IState with
-          member state.Id
-            with get () = id
-          member state.EndPoint
-            with get () = localEp
-          member state.Client
-            with get () = client
-          member state.Subscriptions
-            with get () = subscriptions }
-      |> beginReceive
+      let state =
+        { new IState with
+            member state.Id
+              with get () = id
+            member state.LocalEndPoint
+              with get () = localEp
+            member state.RemoteEndPoint
+              with get () = remoteEp
+            member state.Client
+              with get () = client
+            member state.Subscriptions
+              with get () = subscriptions }
+
+      beginReceive state
 
       { new IPubSub with
           member pubsub.Send(bytes: byte array) =
-            let payload = Array.append (id.ToByteArray()) bytes
-            client.Send(payload, payload.Length, remoteEp) |> ignore
+            beginSend state bytes
 
           member pubsub.Subscribe (callback: PubSubEvent -> unit) =
             Observable.subscribe callback subscriptions
