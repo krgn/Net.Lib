@@ -8,5 +8,24 @@ open System.Threading
 
 [<EntryPoint>]
 let main argv =
-  PubSub.receiver()
+  let port = int argv.[0]
+  let publisher = PubSub.create PubSub.MultiCastAddress port
+
+  let handler = function
+    | PubSubEvent.Request (id, bytes) ->
+      bytes
+      |> Encoding.UTF8.GetString
+      |> printfn "[%O] received: %s" id
+
+  publisher.Subscribe(handler) |> ignore
+
+  let mutable run = true
+  while run do
+    match Console.ReadLine() with
+    | "exit" -> run <- false
+    | other ->
+      other
+      |> Encoding.UTF8.GetBytes
+      |> publisher.Send
+  publisher.Dispose()
   0

@@ -566,40 +566,74 @@ module Lib =
   // |  __/| |_| | |_) |__) | |_| | |_) |
   // |_|    \__,_|_.__/____/ \__,_|_.__/
 
-  module PubSub =
+  module rec PubSub =
 
-    let sender (addr: IPAddress) (port: int) =
-      let udpclient = new UdpClient()
+    let MultiCastAddress = IPAddress.Parse "239.0.0.222"
 
-      let multicastaddress = IPAddress.Parse("239.0.0.222")
-      udpclient.JoinMulticastGroup(multicastaddress)
-      let remoteep = new IPEndPoint(multicastaddress, 2222)
+    type private IState =
+      abstract Id: Guid
+      abstract EndPoint: IPEndPoint
+      abstract Client: UdpClient
+      abstract Subscriptions: ConcurrentDictionary<Guid,IObserver<PubSubEvent>>
 
-      printfn "Press ENTER to start sending messages"
-      Console.ReadLine() |> ignore
+    let private receiveCallback (ar: IAsyncResult) =
+      let state = ar.AsyncState :?> IState
+      let raw = state.Client.EndReceive(ar, &state.EndPoint)
 
-      for i in 0 .. 8000 do
-        let buffer = BitConverter.GetBytes i
-        udpclient.Send(buffer, buffer.Length, remoteep) |> ignore
-        printfn "Sent %d" i
+      let guid =
+        let intermediate = Array.zeroCreate 16
+        Array.blit raw 0 intermediate 0 16
+        Guid intermediate
 
-      Console.WriteLine("All Done! Press ENTER to quit.")
-      Console.ReadLine()
+      if guid <> state.Id then
+        let payload =
+          let intermedate = raw.Length - 16 |> Array.zeroCreate
+          Array.blit raw 16 intermedate 0 (raw.Length - 16)
+          intermedate
 
-    let receiver () =
+        (guid, payload)
+        |> PubSubEvent.Request
+        |> Observable.onNext state.Subscriptions
+
+      beginReceive state
+
+    let private beginReceive (state: IState) =
+      state.Client.BeginReceive(AsyncCallback(receiveCallback), state)
+      |> ignore
+
+    let create (multicastAddress: IPAddress) (port: int) =
+      let id = Guid.NewGuid()
+
+      let subscriptions = ConcurrentDictionary<Guid,IObserver<PubSubEvent>>()
+
       let client = new UdpClient()
       client.ExclusiveAddressUse <- false
 
-      let localEp = new IPEndPoint(IPAddress.Any, 2222)
+      let remoteEp = IPEndPoint(multicastAddress, port)
+      let localEp = IPEndPoint(IPAddress.Any, port)
+
       client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true)
       client.Client.Bind(localEp)
+      client.JoinMulticastGroup(multicastAddress)
 
-      let multicastaddress = IPAddress.Parse("239.0.0.222")
-      client.JoinMulticastGroup(multicastaddress)
+      { new IState with
+          member state.Id
+            with get () = id
+          member state.EndPoint
+            with get () = localEp
+          member state.Client
+            with get () = client
+          member state.Subscriptions
+            with get () = subscriptions }
+      |> beginReceive
 
-      printfn "Listening this will never quit so you will need to ctrl-c it"
+      { new IPubSub with
+          member pubsub.Send(bytes: byte array) =
+            let payload = Array.append (id.ToByteArray()) bytes
+            client.Send(payload, payload.Length, remoteEp) |> ignore
 
-      while true do
-        client.Receive(ref localEp)
-        |> fun bytes -> BitConverter.ToInt32(bytes,0)
-        |> printfn "got: %d"
+          member pubsub.Subscribe (callback: PubSubEvent -> unit) =
+            Observable.subscribe callback subscriptions
+
+          member pubsub.Dispose () =
+            client.Dispose() }
