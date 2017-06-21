@@ -11,10 +11,10 @@ let handler = function
     printfn "connected!"
   | ClientEvent.Disconnect ->
     printfn "disconected"
-  | ClientEvent.Response bytes ->
-    bytes
+  | ClientEvent.Response response ->
+    response.Body
     |> Encoding.UTF8.GetString
-    |> printfn "response: %s"
+    |> printfn "requestid: %O response: %s" response.RequestId
 
 [<EntryPoint>]
 let main argv =
@@ -34,6 +34,8 @@ let main argv =
       | other ->
         other
         |> Encoding.UTF8.GetBytes
+        |> fun body -> { RequestId = Guid.NewGuid(); PeerId = client.Id; Body = body }
+        |> fun req -> printfn "request: %O" req.RequestId; req
         |> client.Send
 
     client.Dispose()

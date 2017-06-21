@@ -23,11 +23,11 @@ let main argv =
             printfn "new connection %O from %O:%d" id ip port
           | ServerEvent.Disconnect id ->
             printfn "connection %O closed" id
-          | ServerEvent.Request(id, body) ->
-            body
+          | ServerEvent.Request request ->
+            request.Body
             |> Encoding.UTF8.GetString
-            |> printfn "got: %s"
-            server.Send id (Encoding.UTF8.GetBytes "Thanks!")
+            |> printfn "requestid: %O payload: %s" request.RequestId
+            server.Send { request with Body = Encoding.UTF8.GetBytes "Thanks!" }
           return! impl()
         }
       impl()

@@ -21,34 +21,48 @@ module Lib =
   //   |_| \__, | .__/ \___||___/
   //       |___/|_|
 
+  type Request =
+    { RequestId: Guid
+      PeerId: Guid
+      Body: byte array }
+
+  type Response = Request
+
   type ClientEvent =
     | Connect
     | Disconnect
-    | Response of byte array
+    | Response of Response
 
   type IClientSocket =
     inherit IDisposable
     abstract Id: Guid
-    abstract Send: byte array -> unit
+    abstract Send: Request -> unit
     abstract Start: unit -> unit
     abstract Subscribe: (ClientEvent -> unit) ->  IDisposable
 
   type ServerEvent =
     | Connect    of id:Guid * ip:IPAddress * Port:int
     | Disconnect of id:Guid
-    | Request    of id:Guid * request:byte array
+    | Request    of Request
 
   type Subscriptions = ConcurrentDictionary<Guid,IObserver<ServerEvent>>
 
   type IConnection =
     inherit IDisposable
     abstract Socket: Socket
-    abstract Send: byte array -> unit
+    abstract Send: Response -> unit
     abstract Id: Guid
     abstract IPAddress: IPAddress
     abstract Port: int
     abstract Buffer: byte array
     abstract BufferSize: int
+    abstract RequestId: Guid option with get, set
+    abstract RequestLength: int with get, set
+    abstract Request: ResizeArray<byte>
+    abstract SetRequestLength: offset:int -> unit
+    abstract SetRequestId: offset:int -> unit
+    abstract CopyData: offset:int -> count:int -> unit
+    abstract FinishRequest: unit -> unit
     abstract Subscriptions: Subscriptions
 
   type Connections = ConcurrentDictionary<Guid,IConnection>
@@ -56,7 +70,7 @@ module Lib =
   type IServer =
     inherit IDisposable
     abstract Connections: Connections
-    abstract Send: Guid -> byte array -> unit
+    abstract Send: Response -> unit
     abstract Subscribe: (ServerEvent -> unit) ->  IDisposable
 
   type PubSubEvent =
@@ -66,6 +80,16 @@ module Lib =
     inherit IDisposable
     abstract Send: byte array -> unit
     abstract Subscribe: (PubSubEvent -> unit) -> IDisposable
+
+
+  [<Literal>]
+  let MSG_LENGTH_OFFSET = 4             // int32 has 4 bytes
+
+  [<Literal>]
+  let ID_LENGTH_OFFSET = 16             // Guid has 16 bytes
+
+  [<Literal>]
+  let HEADER_OFFSET = 20                // total offset, e.g. MSG_LENGTH_OFFSET + ID_LENGTH_OFFSET
 
   //  _   _ _   _ _
   // | | | | |_(_) |___
@@ -118,7 +142,13 @@ module Lib =
       abstract Sent: ManualResetEvent
       abstract Buffer: byte array
       abstract BufferSize: int
+      abstract ResponseId: Guid option with get, set
+      abstract ResponseLength: int with get, set
       abstract Response: ResizeArray<byte>
+      abstract SetResponseId: offset:int -> unit
+      abstract SetResponseLength: offset:int -> unit
+      abstract CopyData: offset:int -> count:int -> unit
+      abstract FinishResponse: unit -> unit
       abstract Subscriptions: Subscriptions
 
     let private connectCallback (ar: IAsyncResult) =
@@ -153,19 +183,32 @@ module Lib =
         let bytesRead = state.Socket.EndReceive(ar)
 
         if bytesRead > 0 then
-          if bytesRead = state.BufferSize then
-            state.Response.AddRange state.Buffer
-          else
-            let intermediate = Array.zeroCreate bytesRead
-            Array.blit state.Buffer 0 intermediate 0 bytesRead
-            state.Response.AddRange intermediate
-          // All the data has arrived; put it in response.
-          if state.Response.Count > 0 then
-            state.Response.ToArray()
-            |> ClientEvent.Response
-            |> Observable.onNext state.Subscriptions
-            state.Response.Clear()
-          beginReceive state
+          // this is a fresh response, so we start of nice and neat
+          if state.Response.Count = 0 && Option.isNone state.ResponseId then
+            state.SetResponseLength 0
+            state.SetResponseId MSG_LENGTH_OFFSET
+            state.CopyData HEADER_OFFSET (bytesRead - HEADER_OFFSET)
+
+          elif state.Response.Count < state.ResponseLength then
+            let required = state.ResponseLength - state.Response.Count
+            if required >= state.BufferSize && bytesRead = state.BufferSize then
+              // just add the entire current buffer
+              state.CopyData 0 state.BufferSize
+            elif required <= bytesRead then
+              state.CopyData 0 required
+              if state.Response.Count = state.ResponseLength then
+                state.FinishResponse()
+              let remaining = bytesRead - required
+              if remaining > 0 && remaining >= HEADER_OFFSET then
+                state.SetResponseLength required
+                state.SetResponseId (required + MSG_LENGTH_OFFSET)
+                state.CopyData (required + HEADER_OFFSET) remaining
+            else state.CopyData 0 bytesRead
+
+          if state.ResponseLength = state.Response.Count then
+            state.FinishResponse()
+
+        beginReceive state
       with
         | exn ->
           exn.Message
@@ -203,13 +246,20 @@ module Lib =
           exn.Message
           |> printfn "exn: %s"
 
-    let private send (state: IState) (data: byte array) =
+    let private send (state: IState) (request: Request) =
       try
+        let header =
+          Array.append
+            (BitConverter.GetBytes request.Body.Length)
+            (request.RequestId.ToByteArray())
+
+        let payload = Array.append header request.Body
+
         // Begin sending the data to the remote device.
         state.Socket.BeginSend(
-          data,
+          payload,
           0,
-          data.Length,
+          payload.Length,
           SocketFlags.None,
           AsyncCallback(sendCallback),
           state)
@@ -232,6 +282,8 @@ module Lib =
         let buffer = Array.zeroCreate bufSize
         let connected = new ManualResetEvent(false)
         let sent = new ManualResetEvent(false)
+        let mutable responseId = None
+        let mutable responseLength = 0
         let response = ResizeArray()
         let subscriptions = Subscriptions()
         { new IState with
@@ -256,6 +308,43 @@ module Lib =
             member state.Response
               with get () = response
 
+            member state.ResponseId
+              with get () = responseId
+               and set id = responseId <- id
+
+            member state.ResponseLength
+              with get ()  = responseLength
+               and set len = responseLength <- len
+
+            member state.SetResponseLength(offset: int) =
+              responseLength <- BitConverter.ToInt32(buffer, offset)
+
+            member state.SetResponseId(offset: int) =
+              responseId <-
+                let intermediary = Array.zeroCreate ID_LENGTH_OFFSET
+                Array.blit buffer offset intermediary 0 ID_LENGTH_OFFSET
+                intermediary
+                |> Guid
+                |> Some
+
+            member state.CopyData (offset: int) (count: int) =
+              let intermediary = Array.zeroCreate count
+              Array.blit buffer offset intermediary 0 count
+              response.AddRange intermediary
+
+            member state.FinishResponse() =
+              match responseId with
+              | Some guid ->
+                { PeerId = id
+                  RequestId = guid
+                  Body = response.ToArray() }
+                |> ClientEvent.Response
+                |> Observable.onNext subscriptions
+                responseLength <- 0
+                responseId <- None
+                response.Clear()
+              | None -> ()
+
             member state.Subscriptions
               with get () = subscriptions
 
@@ -266,9 +355,9 @@ module Lib =
       let checker = Socket.checkState client state.Subscriptions ClientEvent.Disconnect
 
       { new IClientSocket with
-          member socket.Send(bytes) =
+          member socket.Send(request: Request) =
             // Send test data to the remote device.
-            send state bytes
+            send state request
 
           member socket.Start() =
             beginConnect state
@@ -351,12 +440,17 @@ module Lib =
           exn.Message
           |> printfn "sendCallback: exn: %s"
 
-    let send id (socket: Socket) subscriptions (data: byte array) =
+    let send (response: Response) (socket: Socket) id subscriptions =
       try
+        let header =
+          Array.append
+            (BitConverter.GetBytes response.Body.Length)
+            (response.RequestId.ToByteArray())
+        let payload = Array.append header response.Body
         socket.BeginSend(
-          data,
+          payload,
           0,
-          data.Length,
+          payload.Length,
           SocketFlags.None,
           AsyncCallback(sendCallback),
           socket)
@@ -396,17 +490,34 @@ module Lib =
 
         if bytesRead > 0 then
 
-          let payload =
-            if bytesRead = connection.BufferSize then
-              connection.Buffer
-            else
-              let intermediary = Array.zeroCreate bytesRead
-              Array.blit connection.Buffer 0 intermediary 0 bytesRead
-              intermediary
+          printfn "received %d bytes" bytesRead
 
-          (connection.Id, payload)
-          |> ServerEvent.Request
-          |> Observable.onNext connection.Subscriptions
+          // this is a new request, so we determine the length of the request
+          // and the request id
+          if connection.Request.Count = 0 && Option.isNone connection.RequestId then
+            connection.SetRequestLength (offset = 0)
+            connection.SetRequestId MSG_LENGTH_OFFSET
+            connection.CopyData HEADER_OFFSET (bytesRead - HEADER_OFFSET)
+          elif connection.Request.Count < connection.RequestLength then
+            // we are currently working on a request, so we add to request array whatever data is
+            // available
+            let required = connection.RequestLength - connection.Request.Count
+            if required >= connection.BufferSize && bytesRead = connection.BufferSize then
+              // just add the entire current buffer
+              connection.CopyData 0 connection.BufferSize
+            elif required <= bytesRead then
+              connection.CopyData 0 required
+              if connection.Request.Count = connection.RequestLength then
+                connection.FinishRequest()
+              let remaining = bytesRead - required
+              if remaining > 0 && remaining >= HEADER_OFFSET then
+                connection.SetRequestLength required
+                connection.SetRequestId (required + MSG_LENGTH_OFFSET)
+                connection.CopyData (required + HEADER_OFFSET) remaining
+            else connection.CopyData 0 bytesRead
+
+          if connection.RequestLength = connection.Request.Count then
+            connection.FinishRequest()
 
         // keep trying to get more
         beginReceive connection receiveCallback
@@ -430,13 +541,17 @@ module Lib =
       let bufSize = 1024
       let buffer = Array.zeroCreate bufSize
 
+      let mutable requestLength = 0
+      let mutable requestId = None
+      let request = ResizeArray()
+
       let connection =
         { new IConnection with
             member connection.Socket
               with get () = socket
 
-            member connection.Send (bytes: byte array) =
-              send id socket state.Subscriptions bytes
+            member connection.Send (response: Response) =
+              send response socket id state.Subscriptions
 
             member connection.Id
               with get () = id
@@ -452,6 +567,47 @@ module Lib =
 
             member connection.BufferSize
               with get () = bufSize
+
+            member connection.RequestId
+              with get () = requestId
+               and set id = requestId <- id
+
+            member connection.RequestLength
+              with get () = requestLength
+               and set len = requestLength <- len
+
+            member connection.Request
+              with get () = request
+
+            member connection.SetRequestLength(offset: int) =
+              requestLength <- BitConverter.ToInt32(buffer, offset)
+
+            member connection.SetRequestId(offset: int) =
+              requestId <-
+                let intermediary = Array.zeroCreate ID_LENGTH_OFFSET
+                Array.blit buffer offset intermediary 0 ID_LENGTH_OFFSET
+                intermediary
+                |> Guid
+                |> Some
+
+            member connection.CopyData (offset: int) (count: int) =
+              // read the rest into the ResizeArray
+              let intermediary = Array.zeroCreate count
+              Array.blit connection.Buffer offset intermediary 0 count
+              connection.Request.AddRange intermediary
+
+            member connection.FinishRequest() =
+              match requestId with
+              | Some guid ->
+                { PeerId = id
+                  RequestId = guid
+                  Body = request.ToArray() }
+                |> ServerEvent.Request
+                |> Observable.onNext connection.Subscriptions
+                requestLength <- 0
+                requestId <- None
+                request.Clear()
+              | None -> ()
 
             member connection.Subscriptions
               with get () = state.Subscriptions
@@ -540,9 +696,9 @@ module Lib =
           member server.Connections
             with get () = state.Connections
 
-          member server.Send (id: Guid) (bytes: byte array) =
+          member server.Send (response: Response) =
             try
-              state.Connections.[id].Send bytes
+              state.Connections.[response.PeerId].Send response
             with
               | exn ->
                 exn.Message
