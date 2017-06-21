@@ -22,14 +22,15 @@ module Lib =
   //       |___/|_|
 
   type ClientEvent =
-    | Connected
-    | Disconnected
+    | Connect
+    | Disconnect
     | Response of byte array
 
   type IClientSocket =
     inherit IDisposable
     abstract Id: Guid
     abstract Send: byte array -> unit
+    abstract Start: unit -> unit
     abstract Subscribe: (ClientEvent -> unit) ->  IDisposable
 
   type ServerEvent =
@@ -76,6 +77,21 @@ module Lib =
       finally
         socket.Dispose()
 
+    let rec checkState<'t> (socket: Socket)
+                           (subscriptions: ConcurrentDictionary<Guid,IObserver<'t>>)
+                           (ev: 't) =
+      async {
+        do! Async.Sleep(1000)
+        try
+          if isAlive socket then
+            return! checkState socket subscriptions ev
+          else
+            Observable.onNext subscriptions ev
+        with
+          | _ -> Observable.onNext subscriptions ev
+      }
+
+
   //   ____ _ _            _
   //  / ___| (_) ___ _ __ | |_
   // | |   | | |/ _ \ '_ \| __|
@@ -104,7 +120,8 @@ module Lib =
         // Complete the connection.
         state.Socket.EndConnect(ar)
 
-        printfn "Socket connected to %O" state.EndPoint
+        ClientEvent.Connect
+        |> Observable.onNext state.Subscriptions
 
         // Signal that the connection has been made.
         state.Connected.Set() |> ignore
@@ -134,21 +151,19 @@ module Lib =
             let intermediate = Array.zeroCreate bytesRead
             Array.blit state.Buffer 0 intermediate 0 bytesRead
             state.Response.AddRange intermediate
-          receive state
-        else
           // All the data has arrived; put it in response.
           if state.Response.Count > 0 then
             state.Response.ToArray()
             |> ClientEvent.Response
             |> Observable.onNext state.Subscriptions
             state.Response.Clear()
-          receive state
+          beginReceive state
       with
         | exn ->
           exn.Message
           |> printfn "exn: %s"
 
-    let private receive (state: IState) =
+    let private beginReceive (state: IState) =
       try
         // Begin receiving the data from the remote device.
         state.Socket.BeginReceive(
@@ -200,6 +215,7 @@ module Lib =
     let create (addr: IPAddress) (port: int) =
       let id = Guid.NewGuid()
 
+      let cts = new CancellationTokenSource()
       let endpoint = IPEndPoint(addr, port)
       let client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
 
@@ -239,12 +255,17 @@ module Lib =
               Socket.dispose client
           }
 
-      beginConnect state
+      let checker = Socket.checkState client state.Subscriptions ClientEvent.Disconnect
 
       { new IClientSocket with
           member socket.Send(bytes) =
             // Send test data to the remote device.
             send state bytes
+
+          member socket.Start() =
+            beginConnect state
+            Async.Start(checker, cts.Token)
+            beginReceive state
 
           member socket.Id
             with get () = id
@@ -253,6 +274,7 @@ module Lib =
             Observable.subscribe callback state.Subscriptions
 
           member socket.Dispose () =
+            cts.Cancel()
             state.Dispose() }
 
 
@@ -402,23 +424,6 @@ module Lib =
           |> ServerEvent.Disconnect
           |> Observable.onNext connection.Subscriptions
 
-    let rec private checkState (connection: IConnection) =
-      async {
-        do! Async.Sleep(1000)
-        try
-          if Socket.isAlive connection.Socket then
-            return! checkState connection
-          else
-            connection.Id
-            |> ServerEvent.Disconnect
-            |> Observable.onNext connection.Subscriptions
-        with
-          | _ ->
-            connection.Id
-            |> ServerEvent.Disconnect
-            |> Observable.onNext connection.Subscriptions
-      }
-
     let create (state: Shared.IState) (socket: Socket)  =
       let id = Guid.NewGuid()
       let cts = new CancellationTokenSource()
@@ -467,7 +472,13 @@ module Lib =
                 | _ -> ()
               socket.Dispose() }
 
-      Async.Start(checkState connection, cts.Token)
+      let checker =
+        Socket.checkState
+          connection.Socket
+          connection.Subscriptions
+          (ServerEvent.Disconnect connection.Id)
+
+      Async.Start(checker, cts.Token)
       beginReceive connection receiveCallback
       connection
 

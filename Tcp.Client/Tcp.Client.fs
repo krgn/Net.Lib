@@ -7,9 +7,9 @@ open System.Text
 open System.Threading
 
 let handler = function
-  | ClientEvent.Connected ->
+  | ClientEvent.Connect ->
     printfn "connected!"
-  | ClientEvent.Disconnected ->
+  | ClientEvent.Disconnect ->
     printfn "disconected"
   | ClientEvent.Response bytes ->
     bytes
@@ -23,8 +23,9 @@ let main argv =
     let port = int argv.[1]
 
     let client = Client.create addr port
-
     client.Subscribe handler |> ignore
+
+    client.Start()
 
     let mutable run = true
     while run do
