@@ -162,19 +162,32 @@ module Lib =
 
         printfn "Sent %d bytes to client." bytesSent
       with
+        | :? ObjectDisposedException -> ()
         | exn ->
           exn.Message
-          |> printfn "exn: %s"
+          |> printfn "sendCallback: exn: %s"
 
-    let send (socket: Socket) (data: byte array) =
-      socket.BeginSend(
-        data,
-        0,
-        data.Length,
-        SocketFlags.None,
-        AsyncCallback(sendCallback),
-        socket)
-      |> ignore
+    let send id (socket: Socket) subscriptions (data: byte array) =
+      try
+        socket.BeginSend(
+          data,
+          0,
+          data.Length,
+          SocketFlags.None,
+          AsyncCallback(sendCallback),
+          socket)
+        |> ignore
+      with
+        | :? ObjectDisposedException ->
+          id
+          |> ServerEvent.Disconnect
+          |> Observable.onNext subscriptions
+        | exn ->
+          exn.Message
+          |> printfn "EXN: send: %s"
+          id
+          |> ServerEvent.Disconnect
+          |> Observable.onNext subscriptions
 
     let private beginReceive (connection: IConnection) callback =
       connection.Socket.BeginReceive(
@@ -231,6 +244,9 @@ module Lib =
         | exn ->
           exn.Message
           |> printfn "EXN: receiveCallback: %s"
+          connection.Id
+          |> ServerEvent.Disconnect
+          |> Observable.onNext connection.Subscriptions
 
     let private isAlive (socket:Socket) =
       not (socket.Poll(1, SelectMode.SelectRead) && socket.Available = 0)
@@ -266,7 +282,7 @@ module Lib =
               with get () = socket
 
             member connection.Send (bytes: byte array) =
-              send socket bytes
+              send id socket state.Subscriptions bytes
 
             member connection.Id
               with get () = id
@@ -326,7 +342,6 @@ module Lib =
 
         while not (state.Connections.TryAdd(connection.Id, connection)) do
           ignore ()
-
       with
         | exn ->
           exn.Message
