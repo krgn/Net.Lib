@@ -1,6 +1,6 @@
-module Tcp.Client
+module Client
 
-open Tcp.Lib
+open Net.Lib
 open System
 open System.Net
 open System.Text

@@ -1,4 +1,4 @@
-namespace Tcp
+namespace Net
 
 // * Imports
 

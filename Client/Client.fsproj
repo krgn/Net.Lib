@@ -7,12 +7,12 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>4d9e5f3b-2ad9-4264-a3db-55c83647250e</ProjectGuid>
     <OutputType>Exe</OutputType>
-    <RootNamespace>Tcp.Client</RootNamespace>
-    <AssemblyName>Tcp.Client</AssemblyName>
+    <RootNamespace>Client</RootNamespace>
+    <AssemblyName>Client</AssemblyName>
     <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <TargetFSharpCoreVersion>4.4.0.0</TargetFSharpCoreVersion>
-    <Name>Tcp.Client</Name>
+    <Name>Client</Name>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -42,11 +42,11 @@
     <Reference Include="System.Numerics" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Tcp.Client.fs" />
+    <Compile Include="Client.fs" />
     <None Include="App.config" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Tcp.Lib\Tcp.Lib.fsproj">
+    <ProjectReference Include="..\Net.Lib\Net.Lib.fsproj">
       <Name>Core</Name>
       <Project>{4d9e5f3b-2ad9-4264-a3db-55c83647250e}</Project>
       <Private>True</Private>

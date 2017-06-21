@@ -1,6 +1,6 @@
-module Tcp.Sub
+module PubSub
 
-open Tcp.Lib
+open Net.Lib
 open System
 open System.Net
 open System.Text
@@ -21,6 +21,7 @@ let main argv =
 
   let mutable run = true
   while run do
+    Console.Write("> ")
     match Console.ReadLine() with
     | "exit" -> run <- false
     | other ->

@@ -5,14 +5,14 @@
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
     <SchemaVersion>2.0</SchemaVersion>
-    <ProjectGuid>57f67137-f4de-4ba8-ac60-8fb94121a73c</ProjectGuid>
+    <ProjectGuid>551162ae-ebc1-4977-8855-5b80dc2354ab</ProjectGuid>
     <OutputType>Exe</OutputType>
-    <RootNamespace>Tcp.Sub</RootNamespace>
-    <AssemblyName>Tcp.Sub</AssemblyName>
+    <RootNamespace>Server</RootNamespace>
+    <AssemblyName>Server</AssemblyName>
     <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <TargetFSharpCoreVersion>4.4.0.0</TargetFSharpCoreVersion>
-    <Name>Tcp.Sub</Name>
+    <Name>Server</Name>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -42,14 +42,14 @@
     <Reference Include="System.Numerics" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Tcp.Lib\Tcp.Lib.fsproj">
+    <ProjectReference Include="..\Net.Lib\Net.Lib.fsproj">
       <Name>Core</Name>
       <Project>{4d9e5f3b-2ad9-4264-a3db-55c83647250e}</Project>
       <Private>True</Private>
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Tcp.Sub.fs" />
+    <Compile Include="Server.fs" />
     <None Include="App.config" />
   </ItemGroup>
   <PropertyGroup>

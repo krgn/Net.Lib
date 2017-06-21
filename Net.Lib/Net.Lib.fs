@@ -1,4 +1,4 @@
-namespace Tcp
+namespace Net
 
 open System
 open System.Text
