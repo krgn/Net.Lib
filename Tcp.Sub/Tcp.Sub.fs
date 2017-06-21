@@ -1,6 +1,12 @@
 module Tcp.Sub
 
+open Tcp.Lib
+open System
+open System.Net
+open System.Text
+open System.Threading
+
 [<EntryPoint>]
 let main argv =
-    printfn "%A" argv
-    0 // return an integer exit code
+  PubSub.receiver()
+  0

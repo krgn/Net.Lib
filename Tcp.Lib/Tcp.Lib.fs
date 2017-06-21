@@ -59,6 +59,14 @@ module Lib =
     abstract Send: Guid -> byte array -> unit
     abstract Subscribe: (ServerEvent -> unit) ->  IDisposable
 
+  type PubSubEvent =
+    | Request of Guid * byte array
+
+  type IPubSub =
+    inherit IDisposable
+    abstract Send: byte array -> unit
+    abstract Subscribe: (PubSubEvent -> unit) -> IDisposable
+
   //  _   _ _   _ _
   // | | | | |_(_) |___
   // | | | | __| | / __|
@@ -400,16 +408,6 @@ module Lib =
           |> ServerEvent.Request
           |> Observable.onNext connection.Subscriptions
 
-          // // Check for end-of-file tag. If it is not there, read
-          // // more data.
-          // content <- state.Builder.ToString()
-          // if (content.IndexOf("<EOF>") > -1) then
-          //   // All the data has been read from the
-          //   // client. Display it on the console.
-          //   printfn "Read %d bytes from socket. \n Data : %s" content.Length content
-          //   // Echo the data back to the client.
-          // else
-
         // keep trying to get more
         beginReceive connection receiveCallback
       with
@@ -561,3 +559,47 @@ module Lib =
 
             thread.Abort()
             state.Dispose() }
+
+  //  ____        _    ____        _
+  // |  _ \ _   _| |__/ ___| _   _| |__
+  // | |_) | | | | '_ \___ \| | | | '_ \
+  // |  __/| |_| | |_) |__) | |_| | |_) |
+  // |_|    \__,_|_.__/____/ \__,_|_.__/
+
+  module PubSub =
+
+    let sender (addr: IPAddress) (port: int) =
+      let udpclient = new UdpClient()
+
+      let multicastaddress = IPAddress.Parse("239.0.0.222")
+      udpclient.JoinMulticastGroup(multicastaddress)
+      let remoteep = new IPEndPoint(multicastaddress, 2222)
+
+      printfn "Press ENTER to start sending messages"
+      Console.ReadLine() |> ignore
+
+      for i in 0 .. 8000 do
+        let buffer = BitConverter.GetBytes i
+        udpclient.Send(buffer, buffer.Length, remoteep) |> ignore
+        printfn "Sent %d" i
+
+      Console.WriteLine("All Done! Press ENTER to quit.")
+      Console.ReadLine()
+
+    let receiver () =
+      let client = new UdpClient()
+      client.ExclusiveAddressUse <- false
+
+      let localEp = new IPEndPoint(IPAddress.Any, 2222)
+      client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true)
+      client.Client.Bind(localEp)
+
+      let multicastaddress = IPAddress.Parse("239.0.0.222")
+      client.JoinMulticastGroup(multicastaddress)
+
+      printfn "Listening this will never quit so you will need to ctrl-c it"
+
+      while true do
+        client.Receive(ref localEp)
+        |> fun bytes -> BitConverter.ToInt32(bytes,0)
+        |> printfn "got: %d"
