@@ -21,11 +21,16 @@ module Lib =
   //   |_| \__, | .__/ \___||___/
   //       |___/|_|
 
+  type ClientEvent =
+    | Connected
+    | Disconnected
+    | Response of byte array
+
   type IClientSocket =
     inherit IDisposable
     abstract Id: Guid
     abstract Send: byte array -> unit
-    abstract Subscribe: (byte array -> unit) ->  IDisposable
+    abstract Subscribe: (ClientEvent -> unit) ->  IDisposable
 
   type ServerEvent =
     | Connect    of id:Guid * ip:IPAddress * Port:int
@@ -53,53 +58,202 @@ module Lib =
     abstract Send: Guid -> byte array -> unit
     abstract Subscribe: (ServerEvent -> unit) ->  IDisposable
 
+  //  _   _ _   _ _
+  // | | | | |_(_) |___
+  // | | | | __| | / __|
+  // | |_| | |_| | \__ \
+  //  \___/ \__|_|_|___/
+
+  module Socket =
+
+    let isAlive (socket:Socket) =
+      not (socket.Poll(1, SelectMode.SelectRead) && socket.Available = 0)
+
+    let dispose (socket:Socket) =
+      try
+        socket.Shutdown(SocketShutdown.Both)
+        socket.Close()
+      finally
+        socket.Dispose()
+
   //   ____ _ _            _
   //  / ___| (_) ___ _ __ | |_
   // | |   | | |/ _ \ '_ \| __|
   // | |___| | |  __/ | | | |_
   //  \____|_|_|\___|_| |_|\__|
 
-  module Client =
+  module rec Client =
 
-    type Event =
-      | Disconnected
-      | Response of byte array
+    type private Subscriptions = ConcurrentDictionary<Guid,IObserver<ClientEvent>>
 
-    type private Subscriptions = ConcurrentDictionary<Guid,IObserver<Event>>
+    type private IState =
+      inherit IDisposable
+      abstract Socket: Socket
+      abstract EndPoint: IPEndPoint
+      abstract Connected: ManualResetEvent
+      abstract Sent: ManualResetEvent
+      abstract Buffer: byte array
+      abstract BufferSize: int
+      abstract Response: ResizeArray<byte>
+      abstract Subscriptions: Subscriptions
 
-    type private SharedState =
-      { Socket: TcpClient
-        Subscriptions: Subscriptions }
+    let private connectCallback (ar: IAsyncResult) =
+      try
+        let state = ar.AsyncState :?> IState
 
-    let private receiver (state: SharedState) () =
-      let stream = state.Socket.GetStream()
+        // Complete the connection.
+        state.Socket.EndConnect(ar)
 
-      while not (state.Socket.Client.Poll(1, SelectMode.SelectRead) && state.Socket.Client.Available = 0) do
-        printfn "yeeeeeah"
+        printfn "Socket connected to %O" state.EndPoint
 
-      Observable.onNext state.Subscriptions Disconnected
+        // Signal that the connection has been made.
+        state.Connected.Set() |> ignore
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
+
+    // Connect to the remote endpoint.
+    let private beginConnect (state: IState) =
+      state.Socket.BeginConnect(state.EndPoint, AsyncCallback(connectCallback), state) |> ignore
+      state.Connected.WaitOne() |> ignore
+
+    let private receiveCallback (ar: IAsyncResult) =
+      try
+        // Retrieve the state object and the client socket
+        // from the asynchronous state object.
+        let state = ar.AsyncState :?> IState
+
+        // Read data from the remote device.
+        let bytesRead = state.Socket.EndReceive(ar)
+
+        if bytesRead > 0 then
+          if bytesRead = state.BufferSize then
+            state.Response.AddRange state.Buffer
+          else
+            let intermediate = Array.zeroCreate bytesRead
+            Array.blit state.Buffer 0 intermediate 0 bytesRead
+            state.Response.AddRange intermediate
+          receive state
+        else
+          // All the data has arrived; put it in response.
+          if state.Response.Count > 0 then
+            state.Response.ToArray()
+            |> ClientEvent.Response
+            |> Observable.onNext state.Subscriptions
+            state.Response.Clear()
+          receive state
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
+
+    let private receive (state: IState) =
+      try
+        // Begin receiving the data from the remote device.
+        state.Socket.BeginReceive(
+          state.Buffer,
+          0,
+          state.BufferSize,
+          SocketFlags.None,
+          AsyncCallback(receiveCallback),
+          state)
+        |> ignore
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
+
+    let private sendCallback (ar: IAsyncResult) =
+      try
+        let state = ar.AsyncState :?> IState
+
+        // Complete sending the data to the remote device.
+        let bytesSent = state.Socket.EndSend(ar)
+
+        printfn "Sent %d bytes to server." bytesSent
+
+        // Signal that all bytes have been sent.
+        state.Sent.Set() |> ignore
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
+
+    let private send (state: IState) (data: byte array) =
+      try
+        // Begin sending the data to the remote device.
+        state.Socket.BeginSend(
+          data,
+          0,
+          data.Length,
+          SocketFlags.None,
+          AsyncCallback(sendCallback),
+          state)
+        |> ignore
+        state.Sent.WaitOne() |> ignore
+      with
+        | exn ->
+          exn.Message
+          |> printfn "exn: %s"
 
     let create (addr: IPAddress) (port: int) =
       let id = Guid.NewGuid()
 
-      let subscriptions = Subscriptions()
+      let endpoint = IPEndPoint(addr, port)
+      let client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
 
-      let state = Unchecked.defaultof<SharedState>
+      let state =
+        let bufSize = 256
+        let buffer = Array.zeroCreate bufSize
+        let connected = new ManualResetEvent(false)
+        let sent = new ManualResetEvent(false)
+        let response = ResizeArray()
+        let subscriptions = Subscriptions()
+        { new IState with
+            member state.Socket
+              with get () = client
 
-      let receiver: Thread = Thread(ThreadStart(receiver state))
+            member state.EndPoint
+              with get () = endpoint
+
+            member state.Connected
+              with get () = connected
+
+            member state.Sent
+              with get () = sent
+
+            member state.Buffer
+              with get () = buffer
+
+            member state.BufferSize
+              with get () = bufSize
+
+            member state.Response
+              with get () = response
+
+            member state.Subscriptions
+              with get () = subscriptions
+
+            member state.Dispose() =
+              Socket.dispose client
+          }
+
+      beginConnect state
 
       { new IClientSocket with
           member socket.Send(bytes) =
-            failwith "Send"
+            // Send test data to the remote device.
+            send state bytes
 
           member socket.Id
             with get () = id
 
-          member socket.Subscribe (callback: byte array -> unit) =
-            failwith "Subscribe"
+          member socket.Subscribe (callback: ClientEvent -> unit) =
+            Observable.subscribe callback state.Subscriptions
 
           member socket.Dispose () =
-            failwith "Dispose" }
+            state.Dispose() }
 
 
   //  ____  _                        _
@@ -248,14 +402,11 @@ module Lib =
           |> ServerEvent.Disconnect
           |> Observable.onNext connection.Subscriptions
 
-    let private isAlive (socket:Socket) =
-      not (socket.Poll(1, SelectMode.SelectRead) && socket.Available = 0)
-
     let rec private checkState (connection: IConnection) =
       async {
         do! Async.Sleep(1000)
         try
-          if isAlive connection.Socket then
+          if Socket.isAlive connection.Socket then
             return! checkState connection
           else
             connection.Id
