@@ -645,29 +645,29 @@ module Lib =
 
   module Server =
 
-    let private acceptCallback (state: Shared.IState) (result: IAsyncResult) =
-      state.DoneSignal.Set() |> ignore
+    let private acceptCallback =
+      AsyncCallback(fun (result: IAsyncResult) ->
+        let state = result.AsyncState :?> Shared.IState
+        state.DoneSignal.Set() |> ignore
 
-      let state = result.AsyncState :?> Shared.IState
+        try
+          let connection =
+            result
+            |> state.Listener.EndAccept
+            |> Connection.create state
 
-      try
-        let connection =
-          result
-          |> state.Listener.EndAccept
-          |> Connection.create state
-
-        while not (state.Connections.TryAdd(connection.Id, connection)) do
-          ignore ()
-      with
-        | exn ->
-          exn.Message
-          |> printfn "acceptCallback: %s"
+          while not (state.Connections.TryAdd(connection.Id, connection)) do
+            ignore ()
+        with
+          | exn ->
+            exn.Message
+            |> printfn "acceptCallback: %s")
 
     let private acceptor (state: Shared.IState) () =
       while true do
         state.DoneSignal.Reset() |> ignore
         printfn "Waiting for new connections"
-        state.Listener.BeginAccept(AsyncCallback(acceptCallback state), state) |> ignore
+        state.Listener.BeginAccept(acceptCallback, state) |> ignore
         state.DoneSignal.WaitOne() |> ignore
 
     let private cleanUp (connections: Connections) = function
